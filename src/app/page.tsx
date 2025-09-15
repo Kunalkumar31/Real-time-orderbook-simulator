@@ -1,103 +1,267 @@
-import Image from "next/image";
+'use client'; // Enables Client Component mode in Next.js (necessary for useState, useEffect, etc.)
 
-export default function Home() {
+import React, { useState, useEffect } from 'react';
+
+// Importing custom UI components
+import Header from './Components/Header';
+import ControlPanel from './Components/ControlPanel';
+import MetricsPanel from './Components/MetricsPanel';
+import OrderbookDisplay from './Components/OrderbookDisplay';
+import DepthChart from './Components/DepthChart';
+
+// Constants and types
+import { SYMBOLS, WEBSOCKET_URLS, VenueKey, Orderbook } from './lib/constants';
+
+// Interface for simulated order data
+interface SimulatedOrder {
+  orderType: "Market" | "Limit";
+  side: 'Buy' | 'Sell';
+  price: number;
+  quantity: number;
+  delay: string;
+}
+
+export default function App() {
+  // State for current active venue (OKX, BYBIT, or DERIBIT)
+  const [activeVenue, setActiveVenue] = useState<VenueKey>('OKX');
+
+  // State for current symbol selected (based on active venue)
+  const [symbol, setSymbol] = useState(SYMBOLS['OKX'][0]);
+
+  // State to hold live orderbook data (bids and asks)
+  const [orderbook, setOrderbook] = useState<Orderbook>({
+    bids: [],
+    asks: [],
+  });
+
+  // State to track WebSocket connection status
+  const [connectionStatus, setConnectionStatus] = useState('Connecting...');
+
+  // State to manage a currently simulated order (for metrics visualization)
+  const [simulatedOrder, setSimulatedOrder] = useState<SimulatedOrder | null>(null);
+
+  // WebSocket connection and live data handler
+  useEffect(() => {
+    let isMounted = true; // Track if component is mounted
+    let ws: WebSocket | null = null;
+
+    // Reset state on venue or symbol change
+    setOrderbook({ bids: [], asks: [] });
+    setSimulatedOrder(null);
+    setConnectionStatus('Connecting...');
+
+    try {
+      // Open WebSocket connection
+      ws = new WebSocket(WEBSOCKET_URLS[activeVenue]);
+
+      // Handle connection open event
+      ws.onopen = () => {
+        if (!isMounted || !ws) return;
+
+        setConnectionStatus('Connected');
+
+        // Prepare venue-specific subscription message
+        let subMsg;
+        switch (activeVenue) {
+          case 'OKX':
+            subMsg = {
+              op: 'subscribe',
+              args: [{ channel: 'books', instId: symbol }],
+            };
+            break;
+          case 'BYBIT':
+            subMsg = {
+              op: 'subscribe',
+              args: [`orderbook.50.${symbol}`],
+            };
+            break;
+          case 'DERIBIT':
+            subMsg = {
+              jsonrpc: '2.0',
+              id: 1,
+              method: 'public/subscribe',
+              params: {
+                channels: [`book.${symbol}.100ms`],
+              },
+            };
+            break;
+        }
+
+
+        // Send subscription message
+        if (ws.readyState === WebSocket.OPEN && subMsg) {
+          ws.send(JSON.stringify(subMsg));
+        }
+      };
+
+      // Handle incoming WebSocket messages
+      ws.onmessage = (event) => {
+        if (!isMounted) return;
+
+        try {
+          const data = JSON.parse(event.data);
+
+          // Handle error event
+          if (data.event === 'error') {
+            setConnectionStatus(`Error: ${data.msg}`);
+            return;
+          }
+
+          let newBids: { price: number; size: number }[] = [];
+          let newAsks: { price: number; size: number }[] = [];
+
+          // Parse orderbook data for each exchange format
+          switch (activeVenue) {
+            case 'OKX':
+              if (data.arg?.channel === 'books' && Array.isArray(data.data) && data.data.length > 0) {
+                const book = data.data[0];
+                newBids = book.bids.map(([price, size]: [string, string]) => ({
+                  price: parseFloat(price),
+                  size: parseFloat(size),
+                }));
+                newAsks = book.asks.map(([price, size]: [string, string]) => ({
+                  price: parseFloat(price),
+                  size: parseFloat(size),
+                }));
+                setOrderbook({ bids: newBids, asks: newAsks.reverse() }); // Reverse asks for display
+              }
+              break;
+            case 'BYBIT':
+              if (data.topic?.startsWith('orderbook.50') && data.data) {
+                const { b, a } = data.data;
+                newBids = b.map(([price, size]: [string, string]) => ({
+                  price: parseFloat(price),
+                  size: parseFloat(size),
+                }));
+                newAsks = a.map(([price, size]: [string, string]) => ({
+                  price: parseFloat(price),
+                  size: parseFloat(size),
+                }));
+                setOrderbook({ bids: newBids, asks: newAsks });
+              }
+              break;
+            case 'DERIBIT':
+              if (data.method === 'subscription' && data.params?.channel.startsWith('book.')) {
+                const { bids, asks } = data.params.data;
+                newBids = bids.map(([price, size]: [number, number]) => ({ price, size }));
+                newAsks = asks.map(([price, size]: [number, number]) => ({ price, size }));
+                setOrderbook({ bids: newBids, asks: newAsks });
+              }
+              break;
+          }
+        } catch (err) {
+          console.error('WebSocket message parse error:', err);
+          setConnectionStatus('Data parsing error');
+        }
+      };
+
+      // Handle WebSocket disconnection
+      ws.onclose = () => {
+        if (!isMounted) return;
+        setConnectionStatus('Disconnected');
+      };
+
+      // Handle WebSocket error
+      ws.onerror = (err) => {
+        console.error('WebSocket error:', err);
+        if (isMounted) setConnectionStatus('Error');
+      };
+    } catch (err) {
+      console.error('WebSocket setup error:', err);
+      setConnectionStatus('Error creating connection');
+    }
+
+    // Cleanup on unmount or dependency change
+    return () => {
+      isMounted = false;
+      if (ws) {
+        if (ws.readyState === WebSocket.OPEN) {
+          // Send unsubscribe message to avoid stale subscriptions
+          let unsubMsg;
+          switch (activeVenue) {
+            case 'OKX':
+              unsubMsg = { op: 'unsubscribe', args: [{ channel: 'books', instId: symbol }] };
+              break;
+            case 'BYBIT':
+              unsubMsg = { op: 'unsubscribe', args: [`orderbook.50.${symbol}`] };
+              break;
+            case 'DERIBIT':
+              unsubMsg = {
+                jsonrpc: '2.0',
+                method: 'public/unsubscribe',
+                params: { channels: [`book.${symbol}.100ms`] },
+              };
+              break;
+          }
+
+          // Attempt to send unsubscribe message
+          if (unsubMsg) {
+            try {
+              ws.send(JSON.stringify(unsubMsg));
+            } catch (err) {
+              console.warn('Failed to send unsubscribe:', err);
+            }
+          }
+        }
+
+        // Close WebSocket connection
+        ws.close();
+      }
+    };
+  }, [activeVenue, symbol]); // Dependencies to re-run effect on change
+
+  // Handler for venue change (resets symbol too)
+  const handleVenueChange = (venue: VenueKey) => {
+    setActiveVenue(venue);
+    setSymbol(SYMBOLS[venue][0]);
+  };
+
+  // Handler for symbol selection
+  const handleSymbolChange = (newSymbol: string) => {
+    setSymbol(newSymbol);
+  };
+
+  // Handler to simulate an order
+  const handleSimulate = (order: SimulatedOrder) => {
+    setSimulatedOrder(order);
+  };
+
+  // Handler to clear simulated order
+  const handleClearSimulation = () => {
+    setSimulatedOrder(null);
+  };
+
+  // UI rendering
   return (
-    <div className="font-sans grid grid-rows-[20px_1fr_20px] items-center justify-items-center min-h-screen p-8 pb-20 gap-16 sm:p-20">
-      <main className="flex flex-col gap-[32px] row-start-2 items-center sm:items-start">
-        <Image
-          className="dark:invert"
-          src="/next.svg"
-          alt="Next.js logo"
-          width={180}
-          height={38}
-          priority
-        />
-        <ol className="font-mono list-inside list-decimal text-sm/6 text-center sm:text-left">
-          <li className="mb-2 tracking-[-.01em]">
-            Get started by editing{" "}
-            <code className="bg-black/[.05] dark:bg-white/[.06] font-mono font-semibold px-1 py-0.5 rounded">
-              src/app/page.tsx
-            </code>
-            .
-          </li>
-          <li className="tracking-[-.01em]">
-            Save and see your changes instantly.
-          </li>
-        </ol>
+    <div className="bg-gray-900 text-gray-200 font-sans min-h-screen p-4 md:p-6 lg:p-8">
+      <div className="max-w-screen-2xl mx-auto">
+        {/* Header with status info */}
+        <Header status={connectionStatus} activeVenue={activeVenue} symbol={symbol} />
 
-        <div className="flex gap-4 items-center flex-col sm:flex-row">
-          <a
-            className="rounded-full border border-solid border-transparent transition-colors flex items-center justify-center bg-foreground text-background gap-2 hover:bg-[#383838] dark:hover:bg-[#ccc] font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 sm:w-auto"
-            href="https://vercel.com/new?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            <Image
-              className="dark:invert"
-              src="/vercel.svg"
-              alt="Vercel logomark"
-              width={20}
-              height={20}
+        {/* Main layout with sidebar and main content */}
+        <main className="grid grid-cols-1 lg:grid-cols-12 gap-6 mt-6">
+          {/* Left panel with controls and metrics */}
+          <div className="lg:col-span-3 space-y-6">
+            <ControlPanel
+              activeVenue={activeVenue}
+              onVenueChange={handleVenueChange}
+              symbol={symbol}
+              onSymbolChange={handleSymbolChange}
+              onSimulate={handleSimulate}
+              onClear={handleClearSimulation}
+              orderbook={orderbook}
             />
-            Deploy now
-          </a>
-          <a
-            className="rounded-full border border-solid border-black/[.08] dark:border-white/[.145] transition-colors flex items-center justify-center hover:bg-[#f2f2f2] dark:hover:bg-[#1a1a1a] hover:border-transparent font-medium text-sm sm:text-base h-10 sm:h-12 px-4 sm:px-5 w-full sm:w-auto md:w-[158px]"
-            href="https://nextjs.org/docs?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-            target="_blank"
-            rel="noopener noreferrer"
-          >
-            Read our docs
-          </a>
-        </div>
-      </main>
-      <footer className="row-start-3 flex gap-[24px] flex-wrap items-center justify-center">
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org/learn?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/file.svg"
-            alt="File icon"
-            width={16}
-            height={16}
-          />
-          Learn
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://vercel.com/templates?framework=next.js&utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/window.svg"
-            alt="Window icon"
-            width={16}
-            height={16}
-          />
-          Examples
-        </a>
-        <a
-          className="flex items-center gap-2 hover:underline hover:underline-offset-4"
-          href="https://nextjs.org?utm_source=create-next-app&utm_medium=appdir-template-tw&utm_campaign=create-next-app"
-          target="_blank"
-          rel="noopener noreferrer"
-        >
-          <Image
-            aria-hidden
-            src="/globe.svg"
-            alt="Globe icon"
-            width={16}
-            height={16}
-          />
-          Go to nextjs.org →
-        </a>
-      </footer>
+            {/* Show metrics only if a simulated order is active */}
+            {simulatedOrder && <MetricsPanel order={simulatedOrder} orderbook={orderbook} />}
+          </div>
+
+          {/* Right panel with orderbook and depth chart */}
+          <div className="lg:col-span-9 space-y-6">
+            <OrderbookDisplay orderbook={orderbook} simulatedOrder={simulatedOrder} />
+            <DepthChart data={orderbook} />
+          </div>
+        </main>
+      </div>
     </div>
   );
 }
